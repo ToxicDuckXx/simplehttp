@@ -3,7 +3,6 @@
 #include <string.h>
 #include <conio.h>
 #include <process.h>
-#include <dirent.h>
 
 #include <winsock2.h>
 #include <windows.h>
@@ -13,11 +12,29 @@ typedef struct {
     const char* url;
     UrlHandlerFunc handler;
 } UrlHandler;
-static UrlHandler url_handlers[25];
+static const char* error_handler_path;
+static UrlHandler url_handlers[MAX_URLS];
 static int url_handler_count = 0;
 static const char* static_folder = NULL;
-static char static_files[50][MAX_PATH];
+static char static_files[MAX_STATIC_FILES][MAX_PATH];
 static int static_file_count = 0;
+
+//Eventuall should probably do this from a file instead of just a lot of if statements. 
+static const char* file_to_mime_type(const char* path) {
+    
+    const char* last_dot = strrchr(path, '.');
+    if (strcmp(last_dot + 1, "png")==0) {return "image/png";}
+    else if (strcmp(last_dot + 1, "jpg")==0) {return "image/jpeg";}
+    else if (strcmp(last_dot + 1, "css")==0) {return "text/css"; }
+    else if (strcmp(last_dot + 1, "jpg")==0) {return "text/jpeg";}
+    else if (strcmp(last_dot + 1, "js")==0) {return "text/javascript";}
+    else if (strcmp(last_dot + 1, "csv")==0) {return "text/csv";}
+    else if (strcmp(last_dot + 1, "mp3")==0) {return "audio/mpeg";}
+    else if (strcmp(last_dot + 1, "mp4")==0) {return "video/mp4";}
+    else if (strcmp(last_dot + 1, "pdf")==0) {return "application/pdf";}
+    else if (strcmp(last_dot + 1, "webp")==0) {return "image/webp";}
+    else {return "";}
+} 
 
 unsigned int __stdcall thread_handler(void* data) {
 
@@ -27,7 +44,7 @@ unsigned int __stdcall thread_handler(void* data) {
 
     bytes_received = recv(client_socket, rec_buffer, sizeof(rec_buffer), 0);
     char requested_url[256];
-    if (sscanf(rec_buffer,  "GET %255s", requested_url) != 1) {
+    if (sscanf(rec_buffer,  "GET %255[^ \t?]", requested_url) != 1) {
         printf("Failed to parse request\n");
         closesocket(client_socket);
         return 1;
@@ -35,25 +52,37 @@ unsigned int __stdcall thread_handler(void* data) {
 
     for (int i = 0; i < url_handler_count; i++) {
         if (strcmp(requested_url, url_handlers[i].url) == 0) {
-            url_handlers[i].handler(client_socket);
-            break;
+            Request request;
+            char type[10];
+            sscanf(rec_buffer, "%9[^ ]", type);
+            if ((strcmp(type, "POST")) == 0) {request.type = POST;}
+            else if ((strcmp(type, "GET")) == 0) {request.type = GET;}
+            else {request.type = OTHER;}
+            request.client_socket = client_socket;
+            request.request = rec_buffer;
+            url_handlers[i].handler(request);
+            _endthreadex(0);
+            return 0;
         }
     }
-    int len = strlen(requested_url);
-    for (int t = 1; t < len; t++) {
-        requested_url[t - 1] = requested_url[t];
-    }
-    requested_url[len - 1] = '\0'; 
     for (int o = 0; o < static_file_count; o++) {
         if (strcmp(requested_url, static_files[o]) == 0) {
-            len = strlen(static_files[o]);
-            char temp_str[len + 7];
-            strcpy(temp_str, "imgs/");
-            strcpy(temp_str + 5, static_files[o]);
-            serve_static_blob(client_socket, temp_str, "image/png");
+            char buffer[MAX_PATH + 1];
+            strcpy(buffer, static_files[o]);
+            memmove(buffer, buffer+1, strlen(buffer));
+            serve_static_blob(client_socket, buffer, file_to_mime_type(buffer));
+            _endthreadex(0);
+            return 0;
         }
     }
-    _endthreadex(0);
+    if (error_handler_path == NULL) {
+        char response_content[55] = "HTTP/1.1 404 Not Found\r\n\r\n<p>404 - Page not found.</p>";
+        send(client_socket, response_content, strlen(response_content), 0);
+        shutdown(client_socket, SD_SEND);
+        closesocket(client_socket);
+    } else {
+        serve_tempate(client_socket, error_handler_path);
+    }
     return 0;
 }
 
@@ -71,16 +100,26 @@ void start_server(const char* host, int port)
             printf("Error opening static DIR");
             return;
         }
+        char path_buffer[MAX_PATH];
         if (!(FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-
-            strcpy(static_files[static_file_count], FindFileData.cFileName);
+            memset(path_buffer, 0, MAX_PATH);
+            strcpy(path_buffer, "/");
+            strcat(path_buffer, static_folder);
+            strcat(path_buffer, "/");
+            strcat(path_buffer, FindFileData.cFileName);
+            strcpy(static_files[static_file_count], path_buffer);
             static_file_count += 1;
         }
 
         // Loop through all other files in the directory
         while (FindNextFile(hFind, &FindFileData)) {
             if (!(FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                strcpy(static_files[static_file_count], FindFileData.cFileName);
+                memset(path_buffer, 0, MAX_PATH);
+                strcpy(path_buffer, "/");
+                strcat(path_buffer, static_folder);
+                strcat(path_buffer, "/");
+                strcat(path_buffer, FindFileData.cFileName);
+                strcpy(static_files[static_file_count], path_buffer);
                 static_file_count += 1;
             }
         }
@@ -240,9 +279,10 @@ void serve_static_blob(int client_socket, const char* path, const char* type)
             send(client_socket, file_content, file_size, 0);
             
             free(file_content);
+            free(http_response);
+            
         }
-
-        free(http_response);
+        
     }
     
     shutdown(client_socket, SD_SEND);
@@ -252,4 +292,120 @@ void serve_static_blob(int client_socket, const char* path, const char* type)
 void set_static_folder(const char* path)
 {
     static_folder = path;
+}
+
+void serve_dynamic_template(int client_socket, const char* path, const char** data_array)
+{
+    char* http_response;
+    FILE* html_file = fopen(path, "rb");
+    if (html_file == NULL) {
+        const char* response_content = "<p>500 - Internal Server Error: Could not open CSS file</p>";
+        asprintf(&http_response, "HTTP/1.1 500 Internal Server Error\r\n\r\n%s", response_content);
+    } else {
+
+        fseek(html_file, 0, SEEK_END);
+        long file_size = ftell(html_file);
+        fseek(html_file, 0, SEEK_SET);
+        
+        char* html_content = (char*)malloc(file_size+1);
+        fread(html_content, 1, file_size, html_file);
+        //find memory needed
+        html_content[file_size] = '\0';
+        char* match_start;
+        char* search_start = html_content;
+        unsigned int new_string_length = file_size + 1;
+        while ((match_start = strstr(search_start, "{")) != NULL)
+        {
+            if (match_start[2] == '}') {
+                char index_char = match_start[1];
+                if (index_char >= '0' && index_char <= '9') {
+                    int index = index_char - '0';
+                    const char *replacement = data_array[index];
+                    if (replacement == NULL) {printf("Error, HTML parsing invalid digit between {}");}
+                    unsigned int replace_len = strlen(replacement);
+                    if (replace_len > 4) {
+                        new_string_length += (replace_len - 4);
+                        search_start = match_start + 3;
+                        continue;
+                    }
+                }
+            }
+            
+            search_start += 1;
+        }
+
+        //re-allocate adjusing for replacement sizes
+        html_content = (char*)realloc(html_content, new_string_length);
+        search_start = html_content;
+        //Now actually do the replacing
+        while ((match_start = strstr(search_start, "{")) != NULL)
+        {
+            if (match_start[2] == '}') {
+                char index_char = match_start[1];
+                if (index_char >= '0' && index_char <= '9') {
+                    int index = index_char - '0';
+                    const char *replacement = data_array[index];
+                    unsigned int replace_len = strlen(replacement);
+                    memmove(match_start + replace_len, match_start + 3, strlen(match_start)+3);
+                    strncpy(match_start, replacement, replace_len);
+                    search_start = match_start + replace_len;
+                    continue;
+                }
+            }
+            search_start++;
+        }
+        if (file_size <= 0) {
+            const char* response_content = "<p>500 - Internal Server Error: Empty CSS file</p>";
+            asprintf(&http_response, "HTTP/1.1 500 Internal Server Error\r\n\r\n%s", response_content);
+        } else {
+
+            //html_content[new_string_length] = '\0';
+
+            fclose(html_file);
+
+            asprintf(&http_response, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n%s", html_content);
+            free(html_content);
+        }
+        send(client_socket, http_response, strlen(http_response), 0);
+            
+        free(http_response);
+    }
+    shutdown(client_socket, SD_SEND);
+    closesocket(client_socket);
+}
+
+void get_arg(const char* request, const char* arg, char* dest) 
+{
+    const char* arg_start = strstr(request, arg);
+    if (arg_start != NULL) {
+        arg_start += strlen(arg) + 1;
+        sscanf(arg_start, "%255[^ &]", dest);
+        char* index = dest;
+        char* match_start;
+        
+        while ((match_start = strstr(index, "%20")) != NULL) {
+            memmove(match_start + 1, match_start + 3, strlen(match_start)+3);
+            strncpy(match_start, " ", 1);
+            index++;
+        }
+    }
+}
+
+void serve_redirect(int client_socket, const char* url) {
+    char http_response[45 + MAX_PATH] = "HTTP/1.1 302 Found\r\nLocation: ";
+    strcat(http_response, url);
+    strcat(http_response, "\r\n\r\n");
+    send(client_socket, http_response, strlen(http_response), 0);
+}
+
+void get_form_arg(const char* request, const char* name, char* dest) {
+    const char* arg_start = strstr(request, name);
+    if (arg_start != NULL) {
+        arg_start += strlen(name) + 1;
+        sscanf(arg_start, "%255[^ &]", dest);
+    }
+}
+
+void set_error_function(const char* path) {
+    error_handler_path = path;
 }
